@@ -1,0 +1,33 @@
+# ===== 依赖与构建产物 =====
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# ===== 密钥 / 环境变量（切勿提交） =====
+.env
+.env.*
+!.env.example
+server/.env
+server/.env.*
+
+# ===== WorkBuddy 项目数据 =====
+.workbuddy/
+
+# ===== 临时 / 清理脚本 =====
+_clean_appendix.py
+_clean_log.txt
+
+# ===== OCR 语言包压缩档（保留已解压的 .traineddata） =====
+*.traineddata.gz
+
+# ===== 日志与系统文件 =====
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# ===== 编辑器 =====
+.vscode/*
+!.vscode/extensions.json
+.idea/
