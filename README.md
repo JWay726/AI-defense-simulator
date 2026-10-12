@@ -68,7 +68,8 @@
 | 前端 | React 19 + TypeScript + Vite 8 + Tailwind CSS 4 |
 | 后端 | Node.js 22 + Express 5 |
 | 数据库 | MySQL 8（未配置时降级为内存存储） |
-| LLM | DeepSeek `deepseek-chat`（JSON Mode 强制结构化输出） |
+| LLM | DeepSeek `deepseek-chat`，经 **LangChain**（`@langchain/openai` 的 `ChatOpenAI`）封装，JSON Mode 强制结构化输出 |
+| RAG | LangChain `MemoryVectorStore` + 本地离线嵌入（`@xenova/transformers` · `bge-small-zh`），向量检索增强生成 |
 | OCR | tesseract.js（离线）/ 视觉大模型 / 百度 OCR，三层降级 |
 | 文档解析 | pdfjs-dist、mammoth、pptx 结构化抽取 |
 
@@ -123,8 +124,18 @@ DB_USER=root
 DB_PASSWORD=root
 DB_NAME=ai_defense
 
-# 前端调用的 DeepSeek Key（也可在界面"设置"里填写）
+# ===== DeepSeek（LLM 调用已迁移到后端 LangChain，Key 放服务端） =====
+# 后端 server/services/llm.js 读取此变量；也可由前端在请求体里携带 VITE_DEEPSEEK_API_KEY 覆盖
+DEEPSEEK_API_KEY=sk-xxx
+# 可选：自定义兼容端点 / 模型
+# DEEPSEEK_BASE_URL=https://api.deepseek.com
+# DEEPSEEK_MODEL=deepseek-chat
+
+# 可选：前端若填入 Key，会随请求带给后端（优先级低于上面的 DEEPSEEK_API_KEY）
 VITE_DEEPSEEK_API_KEY=
+
+# ===== RAG 本地嵌入模型（可选，默认 Xenova/bge-small-zh-v1.5，首次需联网下载权重） =====
+# RAG_EMBED_MODEL=Xenova/bge-small-zh-v1.5
 
 # OCR（扫描件 / 图片版 PPT）
 OCR_PROVIDER=auto          # auto | tesseract | vision | baidu
@@ -161,11 +172,14 @@ AI答辩模拟器/
 │   │   ├── user.js                  # 用户信息
 │   │   ├── chat.js                  # 会话持久化
 │   │   ├── extract.js               # 文档解析（PDF / DOCX / PPTX）
-│   │   └── ocr.js                   # OCR 异步任务 + jobId 轮询
+│   │   ├── ocr.js                   # OCR 异步任务 + jobId 轮询
+│   │   └── rag.js                   # LangChain + RAG 入口（/api/rag/ingest、/api/rag/complete）
 │   ├── services/
 │   │   ├── ocr.js                   # OCR Provider 三层降级
 │   │   ├── pdfRaster.js             # 扫描版 PDF 抽嵌入图
-│   │   └── office.js                # PPTX / DOCX 结构化抽取
+│   │   ├── office.js                # PPTX / DOCX 结构化抽取
+│   │   ├── rag.js                   # RAG 子系统：分块 + 本地嵌入 + MemoryVectorStore + 检索
+│   │   └── llm.js                   # LangChain LLM 层：ChatOpenAI（DeepSeek 兼容）封装
 │   └── tessdata/                    # 内置 tesseract 语言包（离线可用）
 ├── src/                             # 前端 React + Vite（端口 5173）
 │   ├── main.tsx                     # React 入口
@@ -218,7 +232,9 @@ AI答辩模拟器/
 
 完整的系统实现文档（提示词模板设计、前后端框架部署、端到端产品全过程：上传 → 解析 → OCR（异步）→ 出题 → 并发评分 → 复盘报告）见 **[`3系统实现模块.md`](./3系统实现模块.md)**。
 
-> 本项目未使用 LangChain / 向量数据库 / RAG；LLM 调用通过"三段式提示词模板"（System 人设 + User 上下文 + JSON 输出 Schema）直接驱动 DeepSeek。
+> 本项目**已使用 LangChain + RAG**：所有 LLM 调用经后端 `@langchain/openai` 的 `ChatOpenAI`（DeepSeek 兼容端点）完成，文档接地通过 RAG——上传论文后被切分、用本地 `bge-small-zh` 嵌入模型向量化、存入 `MemoryVectorStore`，出题/评分/追问时按查询召回最相关原文片段注入提示词（检索增强生成）。详见 [3系统实现模块.md](./3系统实现模块.md) 第 3.7 节。
+>
+> **运行降级说明（重要）**：后端服务对 LangChain 采用「动态加载 + 自动降级」设计。若运行环境已 `npm install` 了 `@langchain/openai`、`@langchain/community`、`@xenova/transformers`，则走**真实 LangChain 路径**（ChatOpenAI + bge 本地嵌入 + MemoryVectorStore）；若这些包缺失或无法联网下载嵌入权重，则自动降级为**零依赖本地实现**——LLM 走内置 OpenAI 兼容 HTTP 客户端、RAG 走本地哈希 n-gram 向量检索（余弦相似）。两条路径对上层接口完全一致，应用始终可用。装好依赖即自动切换到真实 LangChain，无需改代码。
 
 ---
 

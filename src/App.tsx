@@ -21,6 +21,7 @@ import {
   generateTypeReport,
   generateFinalReport,
   answerUserQuestion,
+  ingestDocument,
 } from './deepseek';
 import {
   MENTOR_PERSONAS,
@@ -756,6 +757,15 @@ export default function App() {
       30,
       usedOcr ? 'OCR 文本已就绪，正在分析内容…' : '正在按页码分块提取文本...',
     );
+
+    // RAG 入库：把文档正文切分、本地嵌入并存入后端向量库（LangChain + MemoryVectorStore），
+    // 后续出题/评分/追问会基于检索到的真实论文片段做检索增强生成。
+    try {
+      const rag = await ingestDocument(textContent);
+      console.log(`[RAG] 文档已入库：${rag.chunks} 个片段，可用=${rag.available}`);
+    } catch (err) {
+      console.warn('[RAG] 文档入库失败，将退回原文节选模式：', err);
+    }
 
     // 阶段2: 解析中（按页码分块）
     setTimeout(() => {

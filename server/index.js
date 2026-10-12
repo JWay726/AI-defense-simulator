@@ -7,6 +7,7 @@ import userRouter from './routes/user.js';
 import { chatRouter } from './routes/chat.js';
 import { router as extractRouter } from './routes/extract.js';
 import { ocrRouter } from './routes/ocr.js';
+import ragRouter from './routes/rag.js';
 
 const app = express();
 const PORT = process.env.SERVER_PORT || 3001;
@@ -20,6 +21,7 @@ app.use('/api/user', userRouter);
 app.use('/api/chat', chatRouter);
 app.use('/api', extractRouter);
 app.use('/api', ocrRouter);
+app.use('/api/rag', ragRouter);
 
 // 健康检查
 app.get('/api/health', (req, res) => {

@@ -11,7 +11,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@langchain/community": "^0.3.0",
+    "@langchain/core": "^0.3.0",
+    "@langchain/openai": "^0.3.0",
+    "@langchain/textsplitters": "^0.2.0",
     "@napi-rs/canvas": "^0.1.100",
+    "@xenova/transformers": "^1.4.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",

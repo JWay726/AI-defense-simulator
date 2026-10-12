@@ -1,4 +1,3 @@
-import OpenAI from 'openai';
 import { jsonrepair } from 'jsonrepair';
 import {
   MENTOR_PERSONAS,
@@ -9,50 +8,117 @@ import {
   type FinalReportPayload,
 } from './types';
 
-const openai = new OpenAI({
-  baseURL: 'https://api.deepseek.com',
-  apiKey: import.meta.env.VITE_DEEPSEEK_API_KEY || '',
-  dangerouslyAllowBrowser: true,
-});
+// ============================================================
+// LLM 调用层（已迁移到后端 LangChain + RAG）
+//
+// 前端只负责构造提示词；实际推理由 server/services/llm.js 中的
+// LangChain ChatOpenAI（DeepSeek 兼容端点）完成，文档接地由
+// server/services/rag.js 的向量检索增强（本地嵌入 + MemoryVectorStore）。
+// 这样所有"出题 / 评分 / 追问 / 报告 / 自由问答"都跑在 LangChain 链上，
+// 且能基于学生真实论文片段做检索增强生成（RAG）。
+// ============================================================
+
+const RAG_API_BASE = 'http://localhost:3001/api/rag';
+
+type ChatRole = 'system' | 'user';
+interface ChatMessage {
+  role: ChatRole;
+  content: string;
+}
+
+// 当前会话的 RAG 向量库 sessionId；ingestDocument 成功后生效
+let ragSessionId: string | null = null;
+let ragReady = false;
+
+/** 把当前文档正文切分、本地嵌入并存入后端向量库（LangChain MemoryVectorStore） */
+export async function ingestDocument(text: string): Promise<{ chunks: number; available: boolean }> {
+  ragSessionId = crypto.randomUUID();
+  ragReady = false;
+  try {
+    const res = await fetch(`${RAG_API_BASE}/ingest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: ragSessionId, text }),
+    });
+    const data = await res.json();
+    ragReady = Boolean(data.available);
+    return { chunks: data.chunks || 0, available: ragReady };
+  } catch (err: any) {
+    console.warn('[RAG] 文档入库失败，将退回原文节选模式：', err?.message || err);
+    return { chunks: 0, available: false };
+  }
+}
+
+/** 新文档上传或会话重置时调用，清空 RAG 状态 */
+export function resetRag(): void {
+  if (ragSessionId) {
+    fetch(`${RAG_API_BASE}/session/${ragSessionId}`, { method: 'DELETE' }).catch(() => {});
+  }
+  ragSessionId = null;
+  ragReady = false;
+}
+
+interface CompleteOptions {
+  temperature?: number;
+  maxTokens?: number;
+  jsonMode?: boolean;
+  /** RAG 检索查询：出题/评分/追问等需要绑定文档原文时传入 */
+  retrievalQuery?: string;
+}
+
+async function postCompletion(
+  messages: ChatMessage[],
+  options: CompleteOptions = {},
+): Promise<{ result: any }> {
+  const system = messages.find((m) => m.role === 'system')?.content || '';
+  const user = messages.find((m) => m.role === 'user')?.content || '';
+  const res = await fetch(`${RAG_API_BASE}/complete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sessionId: ragSessionId,
+      apiKey: (import.meta as any).env?.VITE_DEEPSEEK_API_KEY || '',
+      system,
+      user,
+      jsonMode: Boolean(options.jsonMode),
+      temperature: options.temperature ?? 0.7,
+      maxTokens: options.maxTokens ?? 2000,
+      // 仅当 RAG 就绪时传检索查询，否则由后端退回"原文节选"模式
+      retrievalQuery: ragReady ? options.retrievalQuery : undefined,
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'RAG 后端调用失败');
+  return data;
+}
 
 async function callDeepSeek(
-  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
-  options?: { temperature?: number; max_tokens?: number; response_format?: { type: 'json_object' | 'text' } },
+  messages: ChatMessage[],
+  options: CompleteOptions = {},
 ): Promise<string> {
-  const completion = await openai.chat.completions.create({
-    model: 'deepseek-chat',
-    messages,
-    temperature: options?.temperature ?? 0.7,
-    max_tokens: options?.max_tokens ?? 2000,
-    ...(options?.response_format ? { response_format: options.response_format } : {}),
-  });
-
-  const content = completion.choices[0]?.message?.content;
-  if (!content) throw new Error('AI 返回内容为空');
-  return content;
+  const data = await postCompletion(messages, options);
+  return typeof data.result === 'string' ? data.result : JSON.stringify(data.result);
 }
 
 async function callDeepSeekJSON(
-  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
-  options?: { temperature?: number },
+  messages: ChatMessage[],
+  options: CompleteOptions = {},
 ): Promise<any> {
-  const text = await callDeepSeek(messages, {
-    ...options,
-    response_format: { type: 'json_object' },
-  });
+  const data = await postCompletion(messages, { ...options, jsonMode: true });
+  const result = data.result;
+  // 后端在 JSON Mode 下已返回解析后的对象；极少数情况返回字符串则前端再修一次
+  if (typeof result === 'object' && result !== null) return result;
+  const text = typeof result === 'string' ? result : JSON.stringify(result);
   try {
     return JSON.parse(text);
   } catch {
-    // 先尝试截取最外层 { ... }
     const match = text.match(/\{[\s\S]*\}/);
     const candidate = match ? match[0] : text;
     try {
       return JSON.parse(candidate);
     } catch {
-      // 用 jsonrepair 自动修复常见 JSON 语法错误（漏逗号、多余逗号、未转义引号等）
       try {
-        const repaired = jsonrepair(candidate);
-        return JSON.parse(repaired);
+        return JSON.parse(jsonrepair(candidate));
       } catch {
         throw new Error('AI 返回格式异常，请重试');
       }
@@ -516,7 +582,7 @@ export async function parseDocument(
   }
 
   const analysisSource = buildAnalysisSource(documentText);
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     {
       role: 'system',
       content: `${personaSystemPrompt(persona)}\n\n你是“答辩文档证据抽取器”，不是自由写作者。\n${documentGroundingRules()}\n\n你的任务是从文档中抽取后续答辩提问所需的结构化事实。所有 evidenceAnchors.quote 必须是文档中的连续原文片段，不能改写。信息不存在就填空数组或写入 missingInformation。返回严格 JSON。`,
@@ -557,7 +623,7 @@ export async function parseDocument(
 async function generateCategories(persona: MentorPersona): Promise<string[]> {
   if (!activeDocumentProfile?.hasSourceText) return [];
 
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     {
       role: 'system',
       content: `${personaSystemPrompt(persona)}\n\n你正在为一份已分析完成的答辩文档设计提问分类。每个分类代表一个可以向学生质询的维度，用于组织答辩练习。\n\n${documentGroundingRules()}\n\n要求：\n- 分类必须基于文档实际内容，反映文档中可以追问的具体方向\n- 每个分类名称 2-8 个汉字，简洁精准\n- 产生 3-5 个分类，覆盖文档不同维度（如动机、方法、实验、数据、局限等）\n- 不要使用泛泛的"逻辑漏洞""数据问题"等笼统名称\n- 返回严格 JSON`,
@@ -609,7 +675,7 @@ export async function generateQuestionByType(
 
   // 最多重试一次，降低同类型问题重复率。
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+    const messages: ChatMessage[] = [
       {
         role: 'system',
         content: `${personaSystemPrompt(persona)}\n\n你是严格、真实的答辩评委。你的目标不是“显得专业”，而是基于学生文档提出可回答、可追证、能暴露真实薄弱点的问题。\n\n${documentGroundingRules()}\n\n【问题设计框架】\n- 共性维度：${COMMON_DEFENSE_DIMENSIONS.join('、')}。\n- 技术独特性：优先使用文档 profile 中 domainSpecificTechniques、methods、assumptions、underExplainedPoints 里的实际内容。\n- 当前问题深度：${depth}。\n- 当前证据状态：${groundingStatus}\n- 不允许问纯是非题；不允许在问题里暗示不存在的实验失败、方法漏洞或数据结论。\n- “质疑”应写成需要作者论证的问题，而不是未经证实的指控。\n- 返回严格 JSON，不要输出 Markdown。`,
@@ -620,7 +686,7 @@ export async function generateQuestionByType(
       },
     ];
 
-    const result = await callDeepSeekJSON(messages, { temperature: 0.25 });
+    const result = await callDeepSeekJSON(messages, { temperature: 0.25, retrievalQuery: vulnerabilityTag });
     const candidate = requireQuestionResult(result);
 
     if (!isDuplicateQuestion(candidate.content, previousQuestions) || attempt === 1) {
@@ -653,7 +719,7 @@ export async function evaluateAnswer(
   persona: MentorPersona,
   question: QuestionCardPayload,
 ): Promise<EvaluationCardPayload> {
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     {
       role: 'system',
       content: `${personaSystemPrompt(persona)}\n\n你正在评估真实答辩回答。必须根据“问题要求 + 学生实际回答 + 文档证据”评分，不能因为回答听起来流畅就默认正确。\n\n${documentGroundingRules()}\n\n${mentorFocusPrompt(persona)}\n\n【自适应评分原则】\n- 针对性与完整性 25分：是否直接回答问题、覆盖核心追问。\n- 证据与事实可靠性 25分：是否引用文档中的方法、实验、结果或明确承认缺失；不得奖励编造数据。\n- 推理与技术理解 25分：因果链、机制、比较和假设是否成立。\n- 边界意识 15分：是否说明限制、适用条件、风险或替代解释。\n- 表达与答辩控制 10分：结构、清晰度、专业性。\n\n注意：并非所有问题都要求数值。动机、理论、伦理、部署类问题不得因没有数字被机械扣分；实验类问题则应重视数据和对照。返回严格 JSON。`,
@@ -664,7 +730,10 @@ export async function evaluateAnswer(
     },
   ];
 
-  const rawResult = await callDeepSeekJSON(messages, { temperature: 0.15 });
+  const rawResult = await callDeepSeekJSON(messages, {
+    temperature: 0.15,
+    retrievalQuery: `${question.content} ${answer}`,
+  });
   const result = requireEvaluationResult(rawResult);
 
   evaluationHistory.push({
@@ -729,7 +798,7 @@ export async function generateFollowUp(
     Math.min(QUESTION_DEPTH_SEQUENCE.length - 1, Math.max(0, followUpCount + 1))
   ];
 
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     {
       role: 'system',
       content: `${personaSystemPrompt(persona)}\n\n你正在进行真实答辩追问。追问必须由学生刚才回答中的具体内容触发，不得无视回答重新问一个泛化问题。\n\n${documentGroundingRules()}\n\n追问策略：\n1. 先找回答中最关键的“未定义术语、跳步推理、缺少证据、适用边界、对照不足或与文档不一致”。\n2. 如果回答已经充分，不要硬说存在漏洞；改问更高层级的边界、反例、迁移或部署问题。\n3. 只追一个核心点，保持可在 120 秒内回答。\n4. 当前追问深度：${followUpDepth}。返回严格 JSON。`,
@@ -740,7 +809,10 @@ export async function generateFollowUp(
     },
   ];
 
-  const result = await callDeepSeekJSON(messages, { temperature: 0.2 });
+  const result = await callDeepSeekJSON(messages, {
+    temperature: 0.2,
+    retrievalQuery: `${originalQuestion} ${answer}`,
+  });
   const content = safeString(result.content);
   if (!content) throw new Error('AI 未返回有效追问');
   rememberQuestion(vulnerabilityTag, content);
@@ -770,7 +842,7 @@ export async function generateInterjection(
   asker: MentorPersona,
   interjectionCount: number,
 ): Promise<QuestionCardPayload> {
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     {
       role: 'system',
       content: `${personaSystemPrompt(interjector)}\n\n你现在身处一个答辩委员会。刚才的问题由${asker.name}（${asker.title || '评委'}）提出，学生已经作答。\n\n现在轮到你**插话追问**。要求：\n1. 你必须从自己的专业视角切入，不要重复${asker.name}的提问角度。\n2. 追问必须由学生刚才回答里的具体表述触发（未定义术语、跳步推理、缺少证据、回避边界）。\n3. 如果回答确实已经充分，不要硬挑毛病，改从你自己的视角问更高层的问题。\n4. 只追一个点，能在 120 秒内回答完。\n\n${documentGroundingRules()}\n\n${mentorFocusPrompt(interjector)}\n\n返回严格 JSON。`,
@@ -781,7 +853,10 @@ export async function generateInterjection(
     },
   ];
 
-  const result = await callDeepSeekJSON(messages, { temperature: 0.35 });
+  const result = await callDeepSeekJSON(messages, {
+    temperature: 0.35,
+    retrievalQuery: `${question.content} ${answer}`,
+  });
   const content = safeString(result.content);
   if (!content) throw new Error('AI 未返回有效插话');
   rememberQuestion(question.vulnerabilityTag || '插话', content);
@@ -831,7 +906,7 @@ export async function generateTemplate(
 ): Promise<string> {
   const tag = question.vulnerabilityTag || '逻辑断层';
   const isToxic = persona.id === 'toxic';
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     {
       role: 'system',
       content: `${personaSystemPrompt(persona)}\n\n学生暂时不会回答。请提供“可据文档填充的高质量回答模板”，而不是替学生编造实验、数字或结论。\n\n${documentGroundingRules()}\n\n凡文档没有明确提供的数字、样本量、参数、结果和引用，一律用方括号占位，例如：[填写本文实验中的准确率]、[说明尚未进行该实验]。${isToxic ? '可以尖锐指出缺口，但不得羞辱或人身攻击。' : '先简短安抚，再提供结构化模板。'}`,
@@ -841,7 +916,7 @@ export async function generateTemplate(
       content: `问题：${question.content}\n漏洞类型：${tag}\n\n【文档画像】\n${profileForPrompt(activeDocumentProfile)}\n\n请生成一个可直接练习的回答模板，要求：\n1. ${isToxic ? '先直白指出当前回答最可能缺失的部分' : '先温和说明可以如何拆解问题'}。\n2. 按“结论先行 → 文档证据 → 技术/逻辑解释 → 对照或边界 → 局限与后续”组织。\n3. 优先引用文档中真实存在的方法、指标、结果和限制。\n4. 对文档缺失内容明确使用占位符，绝不补造。\n5. 针对“${tag}”给出一条答辩时的避坑提醒。\n6. 结尾给出 20 秒精简版回答。`,
     },
   ];
-  return callDeepSeek(messages, { temperature: 0.25, max_tokens: 1600 });
+  return callDeepSeek(messages, { temperature: 0.25, maxTokens: 1600, retrievalQuery: question.content });
 }
 
 // ============================================================
@@ -861,7 +936,7 @@ export async function generateTypeReport(
     improvements: item.improvements,
   }));
 
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     {
       role: 'system',
       content: `${personaSystemPrompt(persona)}\n\n你要生成某一答辩能力类型的阶段复盘。只根据提供的真实评估记录总结表现；没有记录时只能给通用方法，不得假装观察过学生表现。`,
@@ -871,7 +946,7 @@ export async function generateTypeReport(
       content: `漏洞/能力类型：${vulnerabilityType}\n有效评估次数：${records.length}\n平均分：${averageScore ?? '无数据'}\n最近评估：${JSON.stringify(recentFeedback, null, 2)}\n\n【文档画像】\n${profileForPrompt(activeDocumentProfile)}\n\n请生成复盘，包含：\n1. 该类型在本项目中的具体含义。\n2. 有评估记录时，总结已表现出的优势和重复出现的缺口；无记录时明确写“暂无答题数据”。\n3. 给出 2～3 条可执行训练方法。\n4. 给出一个通用回答结构。\n5. 以符合导师人设的一句话收尾。`,
     },
   ];
-  return callDeepSeek(messages, { temperature: 0.25, max_tokens: 1100 });
+  return callDeepSeek(messages, { temperature: 0.25, maxTokens: 1100 });
 }
 
 // ============================================================
@@ -925,7 +1000,7 @@ export async function generateFinalReport(
     return { mentorId: m.id, name: m.name, score: average };
   });
 
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     {
       role: 'system',
       content: `${panelPrompt}\n\n学生的答辩演练已结束。请根据真实题量和评估记录生成综合报告。不得把“做过题”直接等同于“掌握良好”；没有评估数据的类型必须标注证据不足。${isPanel ? '\n\n你现在代表整个答辩委员会出具综合意见，需要兼顾各位评委的不同视角（' + panel.map((p) => p.focus.join('/')).join('；') + '）。' : ''}返回严格 JSON。`,
@@ -935,7 +1010,10 @@ export async function generateFinalReport(
       content: `学生共完成 ${totalQuestions} 道题，总用时 ${totalDuration} 秒。覆盖类型：${typeList || '无'}。\n系统基于真实评估计算的综合分：${computedScore}。\n${isPanel ? `各位评委的平均分：${perMentorScores.map((m) => `${m.name} ${m.score} 分`).join('、')}。\n` : ''}\n各类型统计：\n${JSON.stringify(perTypeStats, null, 2)}\n\n【文档画像】\n${profileForPrompt(activeDocumentProfile)}\n\n请返回 JSON：\n{\n  "templates": {"漏洞类型名称": "该类型的结构化回答框架，缺失事实用方括号占位"},\n  "overallEvaluation": "基于真实评估记录的总体评价，区分已证实表现与暂无数据部分"\n}\n\n要求：\n1. templates 只包含 count > 0 的类型。\n2. 每个模板必须适配本文档领域，但不得编造数值、实验或结论。\n3. overallEvaluation 包含：优势、最高优先级缺口、三条训练建议、答辩前检查项。\n4. 不要重新计算或修改综合分。`,
     },
   ];
-  const result = await callDeepSeekJSON(messages, { temperature: 0.2 });
+  const result = await callDeepSeekJSON(messages, {
+    temperature: 0.2,
+    retrievalQuery: `${activeDocumentProfile?.title || ''} 答辩综合复盘 ${Object.keys(typeCounts).join(' ')}`,
+  });
 
   // 规范化：确保 templates 是 Record<string, string>，overallEvaluation 是 string
   const normalizedTemplates: Record<string, string> = {};
@@ -991,7 +1069,7 @@ export async function answerUserQuestion(
     ? `\n\n用户正在询问同类提问方式。请列出 ${limit} 条彼此不重复的评委追问。每条必须改变证据锚点、认知层级或技术角度，不能只做同义改写。若文档没有依据，明确写成澄清式问题。`
     : '';
 
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     {
       role: 'system',
       content: `${personaSystemPrompt(persona)}\n\n你正在回答学生关于答辩演练的疑问。必须优先依据当前文档与当前问题，不得编造项目事实。\n\n${documentGroundingRules()}\n\n${isSimilarQuestion ? `列出 ${limit} 条有区分度且文档绑定的类似追问。` : '给出专业、可执行、与本文档一致的回答。'}`,
@@ -1002,5 +1080,9 @@ export async function answerUserQuestion(
     },
   ];
 
-  return callDeepSeek(messages, { temperature: 0.25, max_tokens: 1500 });
+  return callDeepSeek(messages, {
+    temperature: 0.25,
+    maxTokens: 1500,
+    retrievalQuery: `${question} ${currentQuestion?.content ?? ''}`,
+  });
 }
