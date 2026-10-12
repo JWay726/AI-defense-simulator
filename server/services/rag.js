@@ -27,6 +27,16 @@ async function loadSplitter() {
 }
 
 async function loadEmbeddings() {
+  // 模型权重默认从国内可达的 hf-mirror.com 下载（可用 HF_ENDPOINT 覆盖为其它镜像/官方源）。
+  // transformers.js 与 @langchain/community 共享同一模块单例，故此处设置 env.remoteHost 会全局生效。
+  const endpoint = `${(process.env.HF_ENDPOINT || 'https://hf-mirror.com').replace(/\/+$/, '')}/`;
+  try {
+    const T = await import('@huggingface/transformers');
+    const env = T.env || (T.default && T.default.env);
+    if (env && 'remoteHost' in env) env.remoteHost = endpoint;
+  } catch {
+    // 忽略：嵌入器内部会自行加载该包
+  }
   const { HuggingFaceTransformersEmbeddings } = await import(
     '@langchain/community/embeddings/huggingface_transformers'
   );
@@ -36,8 +46,23 @@ async function loadEmbeddings() {
 }
 
 async function loadVectorStore() {
-  const { MemoryVectorStore } = await import('@langchain/community/vectorstores/memory');
-  return MemoryVectorStore;
+  // MemoryVectorStore 在不同 LangChain 版本位置不同，按新→旧依次尝试
+  const candidates = [
+    '@langchain/classic/vectorstores/memory', // LangChain 1.x（当前安装版本）
+    '@langchain/community/vectorstores/memory',
+    '@langchain/core/vectorstores/memory',
+    'langchain/vectorstores/memory',
+  ];
+  let lastErr;
+  for (const spec of candidates) {
+    try {
+      const mod = await import(spec);
+      if (mod && mod.MemoryVectorStore) return mod.MemoryVectorStore;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('MemoryVectorStore not found');
 }
 
 // ---------- 本地降级实现（零依赖） ----------

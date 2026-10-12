@@ -69,7 +69,7 @@
 | 后端 | Node.js 22 + Express 5 |
 | 数据库 | MySQL 8（未配置时降级为内存存储） |
 | LLM | DeepSeek `deepseek-chat`，经 **LangChain**（`@langchain/openai` 的 `ChatOpenAI`）封装，JSON Mode 强制结构化输出 |
-| RAG | LangChain `MemoryVectorStore` + 本地离线嵌入（`@xenova/transformers` · `bge-small-zh`），向量检索增强生成 |
+| RAG | LangChain `MemoryVectorStore` + 本地离线嵌入（`@huggingface/transformers` · `bge-small-zh`），向量检索增强生成 |
 | OCR | tesseract.js（离线）/ 视觉大模型 / 百度 OCR，三层降级 |
 | 文档解析 | pdfjs-dist、mammoth、pptx 结构化抽取 |
 
@@ -134,8 +134,10 @@ DEEPSEEK_API_KEY=sk-xxx
 # 可选：前端若填入 Key，会随请求带给后端（优先级低于上面的 DEEPSEEK_API_KEY）
 VITE_DEEPSEEK_API_KEY=
 
-# ===== RAG 本地嵌入模型（可选，默认 Xenova/bge-small-zh-v1.5，首次需联网下载权重） =====
+# ===== RAG 本地嵌入（@huggingface/transformers，默认 Xenova/bge-small-zh-v1.5） =====
 # RAG_EMBED_MODEL=Xenova/bge-small-zh-v1.5
+# 权重下载源：默认国内可达的 hf-mirror.com（无需 VPN）；要用官方源改为 https://huggingface.co
+# HF_ENDPOINT=https://hf-mirror.com
 
 # OCR（扫描件 / 图片版 PPT）
 OCR_PROVIDER=auto          # auto | tesseract | vision | baidu
